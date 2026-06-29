@@ -13,7 +13,7 @@ const qrcode = require('qrcode-terminal');
 const http = require('http');
 const fs = require('fs');
 
-const NOMBRE_GRUPO_DOCIFY = 'ACTA DOCIFY 13 - GONZALEZ';
+const NOMBRE_GRUPO_DOCIFY = 'ACTA DOCIFY 13-GONZALEZ';
 const CURP_REGEX = /[A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d/i;
 const solicitudes = new Map();
 const esperandoCurp = new Map();
