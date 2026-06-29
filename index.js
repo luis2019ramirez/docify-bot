@@ -4,7 +4,7 @@ const fs = require('fs');
 
 // ─── CONFIGURACIÓN ───────────────────────────────────────────────
 // Pon aquí el nombre exacto del grupo de Docify como aparece en WhatsApp
-const NOMBRE_GRUPO_DOCIFY = 'ACTA DOCIFY 13 - GONZ...'; // cámbialo al nombre completo
+const NOMBRE_GRUPO_DOCIFY = 'ACTA DOCIFY 13 - GONZALEZ'; // cámbialo al nombre completo
 
 // Regex para detectar una CURP válida (18 caracteres)
 const CURP_REGEX = /[A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d/i;
