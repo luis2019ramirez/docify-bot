@@ -1,3 +1,13 @@
+// Limpiar bloqueos de Chromium al iniciar
+const { execSync } = require('child_process');
+try {
+    execSync('rm -f /app/.wwebjs_auth/session/SingletonLock');
+    execSync('rm -f /app/.wwebjs_auth/session/.org.chromium.Chromium*');
+    console.log('🧹 Locks limpiados');
+} catch(e) {}
+
+
+
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const http = require('http');
