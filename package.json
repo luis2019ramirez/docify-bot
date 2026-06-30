@@ -1,16 +1,19 @@
 {
   "name": "docify-bot",
-  "version": "1.0.0",
-  "description": "Bot de WhatsApp para solicitar actas via Docify",
+  "version": "2.0.0",
+  "description": "Bot de WhatsApp para actas (Docify) y Constancias de Situacion Fiscal",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "whatsapp-web.js": "^1.23.0",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "puppeteer": "^21.0.0",
+    "jimp": "^0.16.13",
+    "jsqr": "^1.4.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "18.x"
   }
 }
