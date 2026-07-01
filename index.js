@@ -4,27 +4,36 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-// Limpiar archivos de bloqueo de Chromium de una sesion anterior (solo aplica si existen)
-try {
-    const authPath = process.env.WWEBJS_AUTH_PATH || path.join(process.cwd(), '.wwebjs_auth');
-    const lockFile = path.join(authPath, 'session', 'SingletonLock');
-    if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
-} catch(e) {}
-
 // ─── CONFIGURACION ────────────────────────────────────────────────
 const NOMBRE_GRUPO_DOCIFY = 'ACTA DOCIFY 13 - GONZALEZ';
+
+// Grupos donde el bot NO debe responder aunque detecte RFC o idCIF
+const GRUPOS_IGNORADOS = [
+    'id Cif Daniel pagos diarios',
+];
+
 const CSF_URL  = 'https://constancia-7xk29.vercel.app/';
 const CSF_USER = 'daniel.gonzalez';
 const CSF_PASS = 'GonzalezCIF26';
 
+// Tu numero de WhatsApp (para recibir alertas cuando algo falla)
+// Formato: 521 + 10 digitos + @c.us  ej: '5219821108077@c.us'
+const NUMERO_DANIEL = '5219821042410@c.us';
+
+
 const RFC_REGEX   = /\b([A-Z&Ñ]{3,4}\d{6}[A-Z0-9]{3})\b/i;
 const CURP_REGEX  = /[A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d/i;
-const IDCIF_REGEX = /(?:ID\s*)?(\d{8,11})/i;
+const IDCIF_REGEX = /\bID\s*(\d{8,11})\b/i; // Requiere prefijo 'ID' para evitar falsos positivos
 
 const solicitudesActa = new Map();
 const esperandoCurp   = new Map();
 const esperandoIdCIF  = new Map();
-const tipoActaPendiente = new Map(); // numeroCliente -> 'NACIMIENTO'|'MATRIMONIO'|'DIVORCIO'|'DEFUNCION'
+const tipoActaPendiente  = new Map(); // numeroCliente -> 'NACIMIENTO'|'MATRIMONIO'|'DIVORCIO'|'DEFUNCION'
+const esperandoImagenCSF = new Map(); // numeroCliente -> true si el bot pidio imagen de constancia
+
+// ─── COLA DE GENERACION CSF ───────────────────────────────────────
+const colaCSF = []; // { rfc, idcif, numeroCliente, resolve }
+let procesandoCSF = false;
 // ─────────────────────────────────────────────────────────────────
 
 // ─── FUNCION: Validar formato de CURP y dar retroalimentación específica ─
@@ -62,34 +71,79 @@ function validarCURP(texto) {
 const server = http.createServer((req, res) => { res.writeHead(200); res.end('Bot activo'); });
 server.listen(process.env.PORT || 3000);
 
+// ─── LIMPIEZA DE ESTADOS: eliminar sesiones inactivas cada 30 min ─
+const TIMEOUT_SESION = 30 * 60 * 1000; // 30 minutos
+setInterval(() => {
+    const ahora = Date.now();
+    for (const [key, val] of esperandoIdCIF.entries()) {
+        if (val.ts && ahora - val.ts > TIMEOUT_SESION) {
+            esperandoIdCIF.delete(key);
+            esperandoCurp.delete(key);
+            tipoActaPendiente.delete(key);
+            esperandoImagenCSF.delete(key);
+            console.log(`🧹 Sesion expirada limpiada: ${key}`);
+        }
+    }
+}, TIMEOUT_SESION);
+
 // ─── FUNCION: Generar CSF ─────────────────────────────────────────
 async function generarCSF(rfc, idcif) {
+    // Cargar puppeteer compatible con CommonJS y ESM
     let puppeteer;
-    try { puppeteer = require('puppeteer'); } catch(e) { puppeteer = require('puppeteer-core'); }
+    try {
+        puppeteer = require('puppeteer');
+    } catch(e) {
+        try {
+            // puppeteer-core v21+ es ESM — usar dynamic import
+            const mod = await import('puppeteer-core');
+            puppeteer = mod.default || mod;
+        } catch(e2) {
+            console.error('❌ No se pudo cargar puppeteer ni puppeteer-core:', e2.message);
+            return null;
+        }
+    }
 
     console.log(`🌐 Generando CSF: RFC=${rfc} idCIF=${idcif}`);
 
-    const downloadPath = path.join(process.cwd(), 'descargas');
-    if (!fs.existsSync(downloadPath)) fs.mkdirSync(downloadPath);
-    fs.readdirSync(downloadPath).forEach(f => {
-        if (f.endsWith('.pdf')) try { fs.unlinkSync(path.join(downloadPath, f)); } catch(e) {}
-    });
+    const downloadPath = path.join(process.cwd(), 'descargas', `req_${Date.now()}`);
+    if (!fs.existsSync(path.join(process.cwd(), 'descargas'))) fs.mkdirSync(path.join(process.cwd(), 'descargas'));
+    fs.mkdirSync(downloadPath, { recursive: true });
 
-    const launchOptions = {
+    // puppeteer-core requiere especificar la ruta del ejecutable de Chrome.
+    // Buscamos Chrome en las rutas más comunes de Windows.
+    const rutasChrome = [
+        // Linux (Railway/servidor)
+        process.env.CHROMIUM_PATH || '',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        // Windows (local)
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+        'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    ].filter(Boolean);
+    const executablePath = rutasChrome.find(p => { try { return fs.existsSync(p); } catch(e) { return false; } });
+    if (executablePath) console.log(`🌐 Usando navegador: ${executablePath}`);
+
+    const browser = await puppeteer.launch({
         headless: true,
+        executablePath: executablePath || undefined, // undefined = puppeteer usa su propio Chromium
         args: ['--no-sandbox', '--disable-setuid-sandbox']
-    };
-    // En Railway (Linux) usamos el Chromium del sistema operativo
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-        launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    }
-    const browser = await puppeteer.launch(launchOptions);
+    });
 
     try {
         const page = await browser.newPage();
 
-        // Configurar descarga
-        const cdpSession = await page.target().createCDPSession();
+        // Configurar descarga — compatible con puppeteer v19 (target) y v21+ (createCDPSession)
+        let cdpSession;
+        try {
+            cdpSession = await page.createCDPSession();          // puppeteer v21+
+        } catch(e) {
+            cdpSession = await page.target().createCDPSession(); // puppeteer v19
+        }
         await cdpSession.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath });
 
         // Ir a la pagina
@@ -138,23 +192,60 @@ async function generarCSF(rfc, idcif) {
         await new Promise(r => setTimeout(r, 4000));
 
         // Verificar que inició sesión buscando el textarea de pegado rápido
-        const loggedIn = await page.evaluate(() => {
-            return !!document.querySelector('textarea');
-        });
+        let loggedIn = await page.evaluate(() => !!document.querySelector('textarea'));
 
         if (!loggedIn) {
-            console.log('⚠️ No se pudo iniciar sesión en CSF (puede que haya otra sesión activa)');
-            try {
-                const errorMsg = await page.evaluate(() => {
-                    const el = document.querySelector('[class*="error"], [class*="Error"]');
-                    return el ? el.textContent : null;
+            // Verificar si el error es "sesión activa en otro dispositivo"
+            const errorSesion = await page.evaluate(() => {
+                const body = document.body?.innerText || '';
+                return body.includes('sesión activa') || body.includes('otro dispositivo');
+            });
+
+            if (errorSesion) {
+                console.log('⚠️ Sesión activa en otro dispositivo detectada. Intentando forzar cierre...');
+                // Intentar hacer click en botón para forzar cierre de sesión
+                const forzado = await page.evaluate(() => {
+                    const btns = Array.from(document.querySelectorAll('button, a'));
+                    const btn = btns.find(b => /cerrar|forzar|desconectar|continuar|override/i.test(b.textContent));
+                    if (btn) { btn.click(); return true; }
+                    return false;
                 });
-                if (errorMsg) console.log('   Mensaje de error en pagina:', errorMsg);
-                await page.screenshot({ path: path.join(process.cwd(), 'debug_login.png') });
-                console.log('   Screenshot guardado en debug_login.png');
-            } catch(e) {}
-            await browser.close();
-            return null;
+
+                if (forzado) {
+                    console.log('🔄 Click en botón de forzar cierre, reintentando login...');
+                    await new Promise(r => setTimeout(r, 3000));
+                } else {
+                    // No hay botón — rellenar y enviar el form de nuevo (algunos sitios lo permiten)
+                    console.log('🔄 Reintentando login para desplazar la sesión anterior...');
+                    await page.evaluate((user, pass) => {
+                        const inputs = document.querySelectorAll('input');
+                        inputs.forEach(input => {
+                            if (input.type === 'text') { input.value = user; input.dispatchEvent(new Event('input', { bubbles: true })); }
+                            if (input.type === 'password') { input.value = pass; input.dispatchEvent(new Event('input', { bubbles: true })); }
+                        });
+                    }, CSF_USER, CSF_PASS);
+                    await new Promise(r => setTimeout(r, 500));
+                    await page.evaluate(() => {
+                        const btns = document.querySelectorAll('button');
+                        btns.forEach(btn => { if (btn.textContent.trim().toLowerCase().includes('entrar')) btn.click(); });
+                    });
+                    await new Promise(r => setTimeout(r, 4000));
+                }
+
+                loggedIn = await page.evaluate(() => !!document.querySelector('textarea'));
+            }
+
+            if (!loggedIn) {
+                console.log('⚠️ No se pudo iniciar sesión en CSF');
+                try {
+                    const errorMsg = await page.evaluate(() => document.body?.innerText?.slice(0, 200) || '');
+                    if (errorMsg) console.log('   Estado de página:', errorMsg);
+                    await page.screenshot({ path: path.join(process.cwd(), 'debug_login.png') });
+                    console.log('   Screenshot guardado en debug_login.png');
+                } catch(e) {}
+                await browser.close();
+                return null;
+            }
         }
 
         // Usar pegado rápido — escribir RFC e idCIF en el textarea
@@ -180,9 +271,9 @@ async function generarCSF(rfc, idcif) {
 
         await page.screenshot({ path: path.join(process.cwd(), 'debug_antes_generar.png') });
 
-        // Esperar PDF hasta 40 segundos
+        // Esperar PDF hasta 90 segundos
         let pdfPath = null;
-        for (let i = 0; i < 40; i++) {
+        for (let i = 0; i < 90; i++) {
             await new Promise(r => setTimeout(r, 1000));
             const archivos = fs.readdirSync(downloadPath).filter(f =>
                 f.endsWith('.pdf') && !f.endsWith('.crdownload') && !f.endsWith('.tmp')
@@ -191,6 +282,19 @@ async function generarCSF(rfc, idcif) {
                 pdfPath = path.join(downloadPath, archivos[0]);
                 console.log(`✅ PDF descargado: ${archivos[0]}`);
                 break;
+            }
+            // A los 20s sin PDF, tomar screenshot para diagnosticar y reintentar el botón
+            if (i === 20) {
+                console.log('⏳ 20s sin PDF, verificando estado de la página...');
+                await page.screenshot({ path: path.join(process.cwd(), 'debug_20s.png') });
+                // Intentar hacer click en botón de generar/descargar por si Ctrl+Enter no funcionó
+                await page.evaluate(() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const btnGenerar = btns.find(b =>
+                        /generar|descargar|constancia|generate|download/i.test(b.textContent)
+                    );
+                    if (btnGenerar) { btnGenerar.click(); console.log('Click en botón generar'); }
+                }).catch(() => {});
             }
         }
 
@@ -206,7 +310,13 @@ async function generarCSF(rfc, idcif) {
         } catch(e) {}
 
         await browser.close();
-        return pdfPath;
+        if (!pdfPath) {
+            // PDF no descargado — tomar screenshot final y limpiar carpeta temporal
+            console.log('⚠️ PDF no descargado en 90s — revisando logs de Puppeteer');
+            await page.screenshot({ path: path.join(process.cwd(), 'debug_timeout.png') }).catch(() => {});
+            try { fs.rmSync(downloadPath, { recursive: true, force: true }); } catch(e) {}
+        }
+        return pdfPath; // La carpeta se limpia despues de enviar el PDF (cuando pdfPath != null)
 
     } catch (err) {
         console.error('Error generarCSF:', err.message);
@@ -226,17 +336,77 @@ async function generarCSF(rfc, idcif) {
             }
         } catch(e) {}
         try { await browser.close(); } catch(e) {}
+        try { fs.rmSync(downloadPath, { recursive: true, force: true }); } catch(e) {}
         return null;
     }
 }
 
+// ─── FUNCION: Notificar a Daniel cuando algo falla ───────────────
+async function notificarDaniel(mensaje) {
+    try {
+        const chat = await client.getChatById(NUMERO_DANIEL);
+        await chat.sendMessage(mensaje);
+    } catch(e) {
+        console.error('Error notificando a Daniel:', e.message);
+    }
+}
+
+// ─── COLA Y REINTENTOS DE CSF ─────────────────────────────────────
+// Procesa una solicitud a la vez (evita conflictos de sesion en Puppeteer)
+// e intenta hasta 2 veces antes de rendirse.
+async function procesarColaCSF() {
+    if (colaCSF.length === 0) { procesandoCSF = false; return; }
+    procesandoCSF = true;
+
+    const { rfc, idcif, numeroCliente, resolve } = colaCSF.shift();
+    let pdfPath = null;
+
+    for (let intento = 1; intento <= 2; intento++) {
+        console.log(`🔄 CSF intento ${intento}/2 — RFC: ${rfc}`);
+        pdfPath = await generarCSF(rfc, idcif);
+        if (pdfPath) break;
+        if (intento < 2) {
+            console.log('⚠️ Intento 1 fallido, esperando 5s antes de reintentar...');
+            await new Promise(r => setTimeout(r, 5000));
+        }
+    }
+
+    if (!pdfPath) {
+        // Dos intentos fallidos → avisar a Daniel para atender manualmente
+        await notificarDaniel(
+            `⚠️ *Fallo CSF — atender manualmente*\n\n` +
+            `RFC: *${rfc}*\nidCIF: *${idcif}*\nCliente: ${numeroCliente}\n\n` +
+            `No se pudo generar después de 2 intentos.`
+        );
+    }
+
+    resolve(pdfPath);
+    procesarColaCSF(); // siguiente en la cola
+}
+
+function encolarCSF(rfc, idcif, numeroCliente) {
+    return new Promise((resolve) => {
+        colaCSF.push({ rfc, idcif, numeroCliente, resolve });
+        if (!procesandoCSF) procesarColaCSF();
+    });
+}
+
 // ─── FUNCION: Leer QR de imagen ──────────────────────────────────
 async function leerQRdeImagen(mediaBase64) {
+    const tmpPath = path.join(process.cwd(), `tmp_qr_${Date.now()}.jpg`);
     try {
-        const jimpModule = require('jimp');
-        const Jimp = jimpModule.Jimp || jimpModule;
+        // Cargar jimp compatible con CommonJS (v0.x) y ESM (v1.x)
+        let Jimp;
+        try {
+            const jimpModule = require('jimp');
+            Jimp = jimpModule.Jimp || jimpModule;
+        } catch(e) {
+            // jimp v1+ es ESM — usar dynamic import
+            const mod = await import('jimp');
+            Jimp = mod.Jimp || mod.default;
+        }
+
         const jsQR = require('jsqr');
-        const tmpPath = path.join(process.cwd(), 'tmp_qr.jpg');
         fs.writeFileSync(tmpPath, Buffer.from(mediaBase64, 'base64'));
         const imagen = await Jimp.read(tmpPath);
         const { data, width, height } = imagen.bitmap;
@@ -245,6 +415,7 @@ async function leerQRdeImagen(mediaBase64) {
         return code ? code.data : null;
     } catch (err) {
         console.error('Error leerQR:', err.message);
+        if (fs.existsSync(tmpPath)) try { fs.unlinkSync(tmpPath); } catch(e) {}
         return null;
     }
 }
@@ -252,30 +423,37 @@ async function leerQRdeImagen(mediaBase64) {
 // ─── FUNCION: Extraer RFC e idCIF del URL del QR ─────────────────
 function extraerDatosDeURL(url) {
     try {
+        // Solo procesamos QRs del SAT (ignora comprobantes de pago y otros)
+        if (!url.includes('sat.gob.mx')) return null;
+
         const match = url.match(/D3=([^&]+)/);
         if (!match) return null;
         const partes = match[1].split('_');
         if (partes.length < 2) return null;
-        return { idcif: partes[0], rfc: partes[1] };
+
+        const idcif = partes[0];
+        const rfc   = partes[1];
+
+        // Validar que el RFC tenga formato correcto
+        if (!RFC_REGEX.test(rfc)) return null;
+        // Validar que el idCIF sean solo dígitos (8-11)
+        if (!/^\d{8,11}$/.test(idcif)) return null;
+
+        return { idcif, rfc };
     } catch { return null; }
 }
 
 // ─── CLIENTE WHATSAPP ─────────────────────────────────────────────
-const puppeteerConfig = {
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    headless: true
-};
-if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-}
-
 const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: process.env.WWEBJS_AUTH_PATH || undefined }),
+    authStrategy: new LocalAuth(),
     webVersionCache: {
         type: 'remote',
         remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
     },
-    puppeteer: puppeteerConfig
+    puppeteer: {
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        headless: true
+    }
 });
 
 client.on('qr', (qr) => {
@@ -283,14 +461,33 @@ client.on('qr', (qr) => {
     qrcode.generate(qr, { small: true });
 });
 
-client.on('ready', () => {
+let grupoDocifyId = null;
+
+client.on('ready', async () => {
     console.log('✅ Bot conectado y listo');
+    try {
+        const chats = await client.getChats();
+        const grupo = chats.find(c => c.isGroup && c.name.includes(NOMBRE_GRUPO_DOCIFY));
+        if (grupo) {
+            grupoDocifyId = grupo.id._serialized;
+            console.log(`✅ Grupo Docify encontrado: ${grupo.name}`);
+        } else {
+            console.log('⚠️ No se encontró el grupo Docify — verifica el nombre en NOMBRE_GRUPO_DOCIFY');
+        }
+    } catch(e) {
+        console.error('Error buscando grupo Docify:', e.message);
+    }
 });
 
 client.on('message', async (msg) => {
     try {
         const chat = await msg.getChat();
-        const esGrupoDocify = chat.isGroup && chat.name.includes(NOMBRE_GRUPO_DOCIFY);
+        // LOG DE DIAGNÓSTICO — ayuda a identificar de dónde vienen los mensajes
+        console.log(`📩 Mensaje de: ${msg.from} | Grupo: ${chat.isGroup ? chat.name : 'NO'} | Tipo: ${msg.type} | Body: ${(msg.body || '').substring(0, 50)}`);
+
+        const esGrupoDocify  = chat.isGroup && chat.name.includes(NOMBRE_GRUPO_DOCIFY);
+        const esGrupoIgnorado = chat.isGroup && GRUPOS_IGNORADOS.some(n => chat.name.includes(n));
+        if (esGrupoIgnorado) return; // Proveedores u otros grupos → ignorar completamente
 
         // ── MENSAJES DEL GRUPO DOCIFY ─────────────────────────────
         if (esGrupoDocify) {
@@ -348,33 +545,83 @@ client.on('message', async (msg) => {
 
         if (chat.isGroup) return;
 
-        const texto         = msg.body.trim();
+        const texto         = (msg.body || '').trim();
         const textoMayus    = texto.toUpperCase();
         const numeroCliente = msg.from;
 
-        // ── IMAGEN: leer QR de constancia ────────────────────────
+        // ── ARCHIVO PDF: extraer RFC del nombre del archivo ──────────
+        // El SAT genera PDFs con nombre que incluye el RFC (ej: MOHL780629MCCRRR05_RFC.pdf)
+        // jimp no puede leer QR de PDFs, así que usamos el nombre del archivo
+        if (msg.hasMedia && msg.type === 'document') {
+            const nombreArchivo = (msg._data?.filename || '').toUpperCase();
+            const mimeType = msg._data?.mimetype || '';
+
+            if (mimeType.includes('pdf') || nombreArchivo.endsWith('.PDF')) {
+                // Buscar RFC en el nombre del archivo (sin requerir word boundary)
+                const RFC_LOOSE = /([A-Z&Ñ]{3,4}\d{6}[A-Z0-9]{3})/i;
+                const matchRfcEnPDF = nombreArchivo.match(RFC_LOOSE);
+
+                if (matchRfcEnPDF) {
+                    const rfcDelPDF = matchRfcEnPDF[1].toUpperCase();
+                    console.log(`📄 PDF recibido — RFC en nombre de archivo: ${rfcDelPDF}`);
+                    esperandoIdCIF.set(numeroCliente, { rfc: rfcDelPDF, idcif: null, ts: Date.now() });
+                    esperandoImagenCSF.set(numeroCliente, true);
+                    await msg.reply(
+                        `✅ Recibí tu constancia en PDF.\nRFC detectado: *${rfcDelPDF}*\n\n` +
+                        `Ahora necesito tu *ID (idCIF)* — lo encuentras en la parte superior de la constancia como un número de 11 dígitos.\n\nMándamelo y genero la nueva constancia de inmediato.`
+                    );
+                } else {
+                    // PDF sin RFC reconocible en el nombre
+                    await msg.reply(
+                        '📄 Recibí un PDF pero no pude identificar el RFC.\n\n' +
+                        'Por favor mándame:\n1️⃣ Una *foto* de tu constancia (con el QR visible)\n2️⃣ O escríbeme tu *RFC* y tu *ID (idCIF)* por texto'
+                    );
+                }
+                return;
+            }
+        }
+
+        // ── IMAGEN: detectar si es constancia del SAT (QR) ───────────
         if (msg.hasMedia && (msg.type === 'image' || msg.type === 'document')) {
-            await msg.reply('⏳ Recibí tu imagen, leyendo el QR...');
             const media = await msg.downloadMedia();
             const urlQR = await leerQRdeImagen(media.data);
+
             if (urlQR) {
                 const datos = extraerDatosDeURL(urlQR);
                 if (datos) {
-                    await msg.reply(`✅ QR leído:\nRFC: *${datos.rfc}*\nidCIF: *${datos.idcif}*\n\n⏳ Generando constancia...`);
-                    const pdfPath = await generarCSF(datos.rfc, datos.idcif);
+                    // Es una constancia del SAT con QR válido → procesar
+                    esperandoImagenCSF.delete(numeroCliente);
+                    const enEspera = colaCSF.length + (procesandoCSF ? 1 : 0);
+                    const msgEspera = enEspera > 0
+                        ? `✅ QR leído:\nRFC: *${datos.rfc}*\nidCIF: *${datos.idcif}*\n\n⏳ Hay ${enEspera} solicitud(es) antes que la tuya. Te aviso cuando esté lista.`
+                        : `✅ QR leído:\nRFC: *${datos.rfc}*\nidCIF: *${datos.idcif}*\n\n⏳ Generando constancia...`;
+                    await msg.reply(msgEspera);
+                    const pdfPath = await encolarCSF(datos.rfc, datos.idcif, numeroCliente);
                     if (pdfPath) {
-                        const pdfMedia = MessageMedia.fromFilePath(pdfPath);
-                        await msg.reply('✅ Aquí está tu Constancia de Situación Fiscal:');
-                        await chat.sendMessage(pdfMedia, { sendMediaAsDocument: true, filename: `CSF_${datos.rfc}.pdf` });
-                        fs.unlinkSync(pdfPath);
+                        try {
+                            const pdfMedia = MessageMedia.fromFilePath(pdfPath);
+                            // Obtener referencia fresca al chat (la original puede quedar stale
+                            // después de los 40+ segundos que tarda Puppeteer)
+                            const chatFresh = await client.getChatById(numeroCliente);
+                            await chatFresh.sendMessage('✅ Aquí está tu Constancia de Situación Fiscal:');
+                            await chatFresh.sendMessage(pdfMedia, { sendMediaAsDocument: true, filename: `CSF_${datos.rfc}.pdf` });
+                        } catch(envioErr) {
+                            console.error('❌ Error enviando PDF por QR:', envioErr.message);
+                            await notificarDaniel(`⚠️ PDF generado pero falló el envío\nRFC: ${datos.rfc}\nCliente: ${numeroCliente}\nError: ${envioErr.message}`);
+                        }
+                        try { fs.rmSync(path.dirname(pdfPath), { recursive: true, force: true }); } catch(e) {}
                     } else {
-                        await msg.reply('❌ No pude generar la constancia. Mándame el RFC e ID por texto.');
+                        await msg.reply('❌ No pude generar la constancia. Intenta de nuevo o contáctanos directamente.');
                     }
                 } else {
-                    await msg.reply('⚠️ Leí el QR pero no pude extraer los datos. Mándame el RFC e ID por texto.');
+                    // Tiene QR pero no es del SAT (comprobante de pago, etc.) → ignorar
                 }
             } else {
-                await msg.reply('⚠️ No pude leer el QR. Por favor mándame el RFC y el ID por texto.');
+                // No se pudo leer el QR
+                if (esperandoImagenCSF.get(numeroCliente)) {
+                    await msg.reply('📸 No pude leer el QR de tu imagen. Por favor mándame una foto *más clara* de tu Constancia de Situación Fiscal, asegurándote de que el código QR se vea bien.');
+                }
+                // Si no estaba en flujo, ignorar silenciosamente
             }
             return;
         }
@@ -383,13 +630,22 @@ client.on('message', async (msg) => {
         const matchRFC = textoMayus.match(RFC_REGEX);
         const tieneRFC = matchRFC && !textoMayus.match(CURP_REGEX);
 
-        // Buscamos el idCIF quitando primero el RFC del texto, para que el RFC
-        // no se confunda como si fuera el numero de idCIF
+        // Buscamos el idCIF quitando primero el RFC del texto
         const textoSinRFC = tieneRFC ? textoMayus.replace(matchRFC[0], '') : textoMayus;
-        const matchID = textoSinRFC.match(IDCIF_REGEX);
-        const tieneID = !!matchID;
+
+        // Primero intentar con prefijo "ID xxx"; si no hay prefijo, aceptar numero suelto
+        // cuando: hay RFC en el mismo mensaje, O el cliente ya está esperando dar su idCIF
+        let matchID = textoSinRFC.match(IDCIF_REGEX);
+        if (!matchID && (tieneRFC || esperandoIdCIF.has(numeroCliente))) {
+            matchID = textoSinRFC.match(/\b(\d{8,11})\b/);
+        }
+        const tieneID    = !!matchID;
+        const tieneSinID = textoMayus.includes('SIN ID');
 
         if (tieneRFC || tieneID) {
+            // Limpiar estado de actas si el cliente cambia de flujo a CSF
+            esperandoCurp.delete(numeroCliente);
+            tipoActaPendiente.delete(numeroCliente);
             const pendiente = esperandoIdCIF.get(numeroCliente) || {};
             let rfc   = pendiente.rfc;
             let idcif = pendiente.idcif;
@@ -403,18 +659,42 @@ client.on('message', async (msg) => {
                 console.log(`📨 idCIF de ${numeroCliente}: ${idcif}`);
             }
 
+            // Cliente mandó RFC pero dice "SIN ID" → pedirle que lo consiga
+            if (rfc && tieneSinID && !idcif) {
+                esperandoIdCIF.set(numeroCliente, { rfc, idcif: null, ts: Date.now() });
+                await msg.reply(
+                    `✅ RFC recibido: *${rfc}*\n\n` +
+                    `⚠️ Para generar tu constancia también necesito tu *ID (idCIF)*.\n\n` +
+                    `Lo encuentras en:\n• Una constancia anterior (número de 11 dígitos en la parte superior)\n• Portal del SAT → sat.gob.mx → "Genera tu constancia de situación fiscal"\n\n` +
+                    `Cuando lo tengas, mándamelo y lo proceso de inmediato.`
+                );
+                return;
+            }
+
             // Si ya tenemos los dos datos, generamos la constancia
             if (rfc && idcif) {
                 esperandoIdCIF.delete(numeroCliente);
-                await msg.reply(`✅ Datos recibidos:\nRFC: *${rfc}*\nidCIF: *${idcif}*\n\n⏳ Generando constancia, espera unos segundos...`);
-                const pdfPath = await generarCSF(rfc, idcif);
+                const enEspera = colaCSF.length + (procesandoCSF ? 1 : 0);
+                const msgEspera = enEspera > 0
+                    ? `✅ Datos recibidos:\nRFC: *${rfc}*\nidCIF: *${idcif}*\n\n⏳ Hay ${enEspera} solicitud(es) antes que la tuya. Te aviso cuando esté lista.`
+                    : `✅ Datos recibidos:\nRFC: *${rfc}*\nidCIF: *${idcif}*\n\n⏳ Generando constancia, espera unos segundos...`;
+                await msg.reply(msgEspera);
+                const pdfPath = await encolarCSF(rfc, idcif, numeroCliente);
                 if (pdfPath) {
-                    const pdfMedia = MessageMedia.fromFilePath(pdfPath);
-                    await msg.reply('✅ Aquí está tu Constancia de Situación Fiscal:');
-                    await chat.sendMessage(pdfMedia, { sendMediaAsDocument: true, filename: `CSF_${rfc}.pdf` });
-                    fs.unlinkSync(pdfPath);
+                    try {
+                        const pdfMedia = MessageMedia.fromFilePath(pdfPath);
+                        // Obtener referencia fresca al chat (la original puede quedar stale
+                        // después de los 40+ segundos que tarda Puppeteer)
+                        const chatFresh = await client.getChatById(numeroCliente);
+                        await chatFresh.sendMessage('✅ Aquí está tu Constancia de Situación Fiscal:');
+                        await chatFresh.sendMessage(pdfMedia, { sendMediaAsDocument: true, filename: `CSF_${rfc}.pdf` });
+                    } catch(envioErr) {
+                        console.error('❌ Error enviando PDF por texto:', envioErr.message);
+                        await notificarDaniel(`⚠️ PDF generado pero falló el envío\nRFC: ${rfc}\nCliente: ${numeroCliente}\nError: ${envioErr.message}`);
+                    }
+                    try { fs.rmSync(path.dirname(pdfPath), { recursive: true, force: true }); } catch(e) {}
                 } else {
-                    await msg.reply('❌ No pude generar la constancia. Intenta de nuevo en unos minutos.');
+                    await msg.reply('❌ No pude generar la constancia. Intenta de nuevo o contáctanos directamente.');
                 }
                 return;
             }
@@ -422,8 +702,10 @@ client.on('message', async (msg) => {
             // Si solo tenemos uno de los dos, guardamos y pedimos el que falta
             esperandoIdCIF.set(numeroCliente, { rfc, idcif, ts: Date.now() });
             if (rfc && !idcif) {
+                esperandoImagenCSF.set(numeroCliente, true);
                 await msg.reply(`✅ RFC recibido: *${rfc}*\nAhora mándame el *ID* (idCIF).`);
             } else if (idcif && !rfc) {
+                esperandoImagenCSF.set(numeroCliente, true);
                 await msg.reply(`✅ ID recibido: *${idcif}*\nAhora mándame el *RFC*.`);
             }
             return;
@@ -433,6 +715,35 @@ client.on('message', async (msg) => {
         const matchCurp = textoMayus.match(CURP_REGEX);
         if (matchCurp) {
             const curp = matchCurp[0].toUpperCase();
+
+            // Si el cliente estaba en flujo de CSF (esperando RFC o idCIF)
+            // y NO está en flujo de actas, la CURP es un error — le explicamos la diferencia
+            if (esperandoIdCIF.has(numeroCliente) && !esperandoCurp.get(numeroCliente)) {
+                await msg.reply(
+                    `⚠️ Eso que mandaste es tu *CURP*, no tu *RFC*.\n\n` +
+                    `El RFC tiene *13 caracteres* (4 letras + 6 números + 3 caracteres), por ejemplo: *GORL980330HCC*\n\n` +
+                    `Lo encuentras en:\n• Tu constancia de situación fiscal anterior\n• El portal del SAT: sat.gob.mx`
+                );
+                return;
+            }
+
+            // Verificar que la CURP no sea parte de una cadena mas larga (ej. GORL980330HCCNMS17X)
+            const idxCurp = textoMayus.indexOf(curp);
+            const charAntes = idxCurp > 0 ? textoMayus[idxCurp - 1] : ' ';
+            const charDespues = idxCurp + 18 < textoMayus.length ? textoMayus[idxCurp + 18] : ' ';
+            if (/[A-Z0-9]/i.test(charAntes) || /[A-Z0-9]/i.test(charDespues)) {
+                // Hay caracteres pegados antes o despues — no es una CURP valida
+                const validacion = validarCURP(textoMayus);
+                if (validacion) {
+                    await msg.reply(
+                        `⚠️ La CURP que mandaste no tiene el formato correcto:\n*${validacion.valor}*\n\n` +
+                        validacion.errores.map(e => `• ${e}`).join('\n') +
+                        `\n\nUna CURP válida tiene 18 caracteres, por ejemplo: *GORL980330HCCNMS17*\n\nRevisa e inténtalo de nuevo.`
+                    );
+                    esperandoCurp.set(numeroCliente, true);
+                }
+                return;
+            }
 
             // Buscamos si el tipo de acta viene en el mismo mensaje
             const palabrasMatrimonioInline = ['MATRIMONIO', 'CASAD', 'BODA'];
@@ -454,9 +765,18 @@ client.on('message', async (msg) => {
             solicitudesActa.set(curp, numeroCliente);
             esperandoCurp.delete(numeroCliente);
             tipoActaPendiente.delete(numeroCliente);
-            const chats = await client.getChats();
-            const grupo = chats.find(c => c.isGroup && c.name.includes(NOMBRE_GRUPO_DOCIFY));
-            if (grupo) await grupo.sendMessage(`${curp} ${tipoActa}`);
+            if (grupoDocifyId) {
+                const grupoChat = await client.getChatById(grupoDocifyId);
+                await grupoChat.sendMessage(`${curp} ${tipoActa}`);
+            } else {
+                console.log('⚠️ Grupo Docify no encontrado, reintentando busqueda...');
+                const chats = await client.getChats();
+                const grupo = chats.find(c => c.isGroup && c.name.includes(NOMBRE_GRUPO_DOCIFY));
+                if (grupo) {
+                    grupoDocifyId = grupo.id._serialized;
+                    await grupo.sendMessage(`${curp} ${tipoActa}`);
+                }
+            }
             return;
         }
 
@@ -489,6 +809,10 @@ client.on('message', async (msg) => {
         const palabrasActaGenerica = ['ACTA'];
 
         if (palabrasCSF.some(p => textoMayus.includes(p)) || palabrasRFCmencion.some(p => textoMayus.includes(p))) {
+            // Limpiar estado de actas si el cliente cambia de flujo
+            esperandoCurp.delete(numeroCliente);
+            tipoActaPendiente.delete(numeroCliente);
+            esperandoImagenCSF.set(numeroCliente, true);
             await msg.reply('📄 Para tu *Constancia de Situación Fiscal*:\n\n1️⃣ *Mándame la foto* de tu constancia (con QR visible)\n2️⃣ O mándame tu *RFC* y luego tu *ID (idCIF)*');
             return;
         }
@@ -501,6 +825,9 @@ client.on('message', async (msg) => {
         else if (palabrasNacimiento.some(p => textoMayus.includes(p))) tipoDetectado = 'NACIMIENTO';
 
         if (tipoDetectado) {
+            // Limpiar estado de CSF si el cliente cambia de flujo
+            esperandoIdCIF.delete(numeroCliente);
+            esperandoImagenCSF.delete(numeroCliente);
             tipoActaPendiente.set(numeroCliente, tipoDetectado);
             esperandoCurp.set(numeroCliente, true);
             const nombreBonito = {
@@ -513,12 +840,36 @@ client.on('message', async (msg) => {
 
         // Pidio "acta" generico sin especificar tipo
         if (palabrasActaGenerica.some(p => textoMayus.includes(p))) {
+            // Limpiar estado de CSF si el cliente cambia de flujo
+            esperandoIdCIF.delete(numeroCliente);
+            esperandoImagenCSF.delete(numeroCliente);
+            // Marcar que estamos esperando tipo + CURP
+            esperandoCurp.set(numeroCliente, true);
             await msg.reply(
                 '📋 ¿Qué tipo de acta necesitas?\n\n' +
                 '1️⃣ Nacimiento\n2️⃣ Matrimonio\n3️⃣ Divorcio\n4️⃣ Defunción\n\n' +
-                'Respóndeme con el tipo y después tu CURP.'
+                'Respóndeme con el número o el tipo, y después tu CURP.'
             );
             return;
+        }
+
+        // Si ya está esperando CURP y el cliente responde con número (1-4) o nombre de tipo
+        if (esperandoCurp.get(numeroCliente) && !tipoActaPendiente.get(numeroCliente)) {
+            const tipoMapa = {
+                '1': 'NACIMIENTO', 'NACIMIENTO': 'NACIMIENTO',
+                '2': 'MATRIMONIO', 'MATRIMONIO': 'MATRIMONIO', 'CASAD': 'MATRIMONIO', 'BODA': 'MATRIMONIO',
+                '3': 'DIVORCIO',   'DIVORCIO': 'DIVORCIO',
+                '4': 'DEFUNCION',  'DEFUNCION': 'DEFUNCION',
+            };
+            const limpio = textoMayus.trim();
+            const tipoSel = tipoMapa[limpio] ||
+                Object.entries(tipoMapa).find(([k]) => limpio.startsWith(k) && k.length > 1)?.[1];
+            if (tipoSel) {
+                tipoActaPendiente.set(numeroCliente, tipoSel);
+                const nombre = { NACIMIENTO: 'nacimiento', MATRIMONIO: 'matrimonio', DIVORCIO: 'divorcio', DEFUNCION: 'defunción' }[tipoSel];
+                await msg.reply(`📋 Perfecto, acta de *${nombre}*.\n\nAhora mándame tu *CURP*.\n\nLa encuentras en:\n• curp.sep.gob.mx\n• Tu INE o pasaporte`);
+                return;
+            }
         }
 
         // Si ya estaba esperando CURP de una solicitud de acta ya iniciada,

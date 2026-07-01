@@ -1,24 +1,35 @@
 FROM node:18-slim
 
-# Dependencias necesarias para Chromium (Puppeteer) y para procesar imagenes (Jimp)
+# Instalar Chromium y dependencias para Puppeteer en Linux
 RUN apt-get update && apt-get install -y \
     chromium \
-    fonts-freefont-ttf \
-    libnss3 \
-    libatk-bridge2.0-0 \
     libxss1 \
+    libgbm1 \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgtk-3-0 \
     libasound2 \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Le decimos a Puppeteer que use el Chromium ya instalado en el sistema
-# en vez de intentar descargar el suyo (mas rapido y mas liviano)
+# Decirle a Puppeteer dónde está Chromium
+ENV CHROMIUM_PATH=/usr/bin/chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
+
 COPY package*.json ./
 RUN npm install
+
 COPY . .
 
+EXPOSE 3000
 CMD ["node", "index.js"]

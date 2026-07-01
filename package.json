@@ -1,7 +1,7 @@
 {
   "name": "docify-bot",
-  "version": "2.0.0",
-  "description": "Bot de WhatsApp para actas (Docify) y Constancias de Situacion Fiscal",
+  "version": "1.0.0",
+  "description": "Bot de WhatsApp para Docify — CSF y actas civiles",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,11 +9,11 @@
   "dependencies": {
     "whatsapp-web.js": "^1.23.0",
     "qrcode-terminal": "^0.12.0",
-    "puppeteer": "^21.0.0",
-    "jimp": "^0.16.13",
+    "puppeteer": "^21.11.0",
+    "jimp": "0.22.12",
     "jsqr": "^1.4.0"
   },
   "engines": {
-    "node": "18.x"
+    "node": ">=18.0.0"
   }
 }
